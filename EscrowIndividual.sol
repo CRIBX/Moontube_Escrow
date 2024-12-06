@@ -1,37 +1,65 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity 0.8.28;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "./MoontuberEscrow.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./IMoontuberEscrow.sol";
 
 /**
  * @title EscrowIndividual
- * @dev Individual escrow contract created per customer deposit for transferring funds to Moontuber upon service completion
+ * @dev Individual escrow contract created per customer deposit for transferring funds to Moontuber upon service completion.
+ * This contract handles both ETH and ERC20 token transfers with built-in commission calculations and refund capabilities.
  */
 contract EscrowIndividual is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    /// @notice Address of the main escrow contract that created this individual escrow
     address public mainEscrow;
+
+    /// @notice Address of the customer who made the deposit
     address public customer;
+
+    /// @notice Wallet address where ETH commission fees are sent
     address payable public commissionWallet;
+
+    /// @notice Wallet address where token commission fees are sent
     address payable public commissionTokenWallet;
+
+    /// @notice Developer fee percentage in basis points (e.g., 200 = 2%)
     uint256 public devFee;
 
+    /// @notice Address of the Moontuber who will receive the funds
     address public moontuber;
+
+    /// @notice Timestamp when the escrow was created
     uint256 public timestamp;
+
+    /// @notice Flag indicating if funds have been released
     bool public released;
+
+    /// @notice Flag indicating if funds have been refunded
     bool public refunded;
 
+    /// @notice Structure defining an asset (ETH or ERC20) held in escrow
     struct Asset {
-        string assetType; // "ETH" or "ERC20"
+        /// @notice Type of asset ("ETH" or "ERC20")
+        string assetType;
+        /// @notice Contract address of the asset (address(0) for ETH)
         address assetAddress;
+        /// @notice Amount of the asset held in escrow
         uint256 amount;
     }
 
+    /// @notice Primary asset held in escrow
     Asset public primaryAsset;
+
+    /// @notice Additional assets held in escrow
     Asset[] public additionalAssets;
 
+    /// @notice Ensures function can only be called by the main escrow contract
     modifier onlyMainEscrow() {
-        require(msg.sender == mainEscrow, "Caller is not the main escrow contract");
+        require(msg.sender == mainEscrow);
         _;
     }
 
@@ -40,7 +68,8 @@ contract EscrowIndividual is ReentrancyGuard {
      * @param _mainEscrow Address of the main escrow
      * @param _customer Address of the customer
      * @param _commissionWallet Address of the wallet to receive commission fees
-     * @param _devFee Developer fee percentage (in basis points, i.e., 200 = 2%)
+     * @param _commissionTokenWallet Address of the wallet to receive token commission fees
+     * @param _devFee Developer fee percentage (in basis points)
      * @param _moontuber Address of the Moontuber
      * @param primaryAssetType Primary asset type ("ETH" or "ERC20")
      * @param primaryAssetAddress Address of the ERC20 token (zero address for ETH)
@@ -52,7 +81,7 @@ contract EscrowIndividual is ReentrancyGuard {
         address _mainEscrow,
         address _customer,
         address payable _commissionWallet,
-        address payable _comissionTokenWallet,
+        address payable _commissionTokenWallet,
         uint256 _devFee,
         address _moontuber,
         string memory primaryAssetType,
@@ -64,11 +93,11 @@ contract EscrowIndividual is ReentrancyGuard {
         mainEscrow = _mainEscrow;
         customer = _customer;
         commissionWallet = _commissionWallet;
-        commissionTokenWallet = _comissionTokenWallet;
+        commissionTokenWallet = _commissionTokenWallet;
         devFee = _devFee;
         moontuber = _moontuber;
 
-        require(additionalAssetAddresses.length == additionalAmounts.length, "Array lengths do not match");
+        require(additionalAssetAddresses.length == additionalAmounts.length);
 
         if (keccak256(abi.encodePacked(primaryAssetType)) == keccak256(abi.encodePacked("ETH"))) {
             primaryAsset = Asset({
@@ -99,29 +128,28 @@ contract EscrowIndividual is ReentrancyGuard {
 
     /**
      * @notice Releases the funds to the Moontuber upon service completion
+     * @dev Can only be called by the main escrow contract
      */
     function releaseFunds() external onlyMainEscrow nonReentrant {
-        require(!released, "Funds already released.");
+        require(!released);
 
-        uint256 commissionRate = MoontuberEscrow(mainEscrow).moontuberCommissionRates(moontuber) == 0 ? MoontuberEscrow(mainEscrow).getCommissionRates() : MoontuberEscrow(mainEscrow).moontuberCommissionRates(moontuber);
+        uint256 commissionRate = IMoontuberEscrow(payable(mainEscrow)).moontuberCommissionRates(moontuber) == 0 
+            ? IMoontuberEscrow(payable(mainEscrow)).defaultCommissionRate() 
+            : IMoontuberEscrow(payable(mainEscrow)).moontuberCommissionRates(moontuber);
 
         uint256 commissionAmount = primaryAsset.amount * commissionRate / 100;
         uint256 payoutAmount = primaryAsset.amount - commissionAmount;
 
         if (keccak256(abi.encodePacked(primaryAsset.assetType)) == keccak256(abi.encodePacked("ETH"))) {
             (bool moontuberSuccess,) = payable(moontuber).call{value: payoutAmount}("");
-            require(moontuberSuccess, "Failed to send ETH to Moontuber");
+            require(moontuberSuccess);
 
             (bool commissionFeeSuccess,) = commissionWallet.call{value: commissionAmount}("");
-            require(commissionFeeSuccess, "Failed to transfer ETH commission fee");
+            require(commissionFeeSuccess);
         } else {
             IERC20 token = IERC20(primaryAsset.assetAddress);
-
-            bool tokenTransferSuccess = token.transfer(moontuber, payoutAmount);
-            require(tokenTransferSuccess, "Failed to send primary tokens to Moontuber");
-
-            bool commissionFeeTransferSuccess = token.transfer(commissionWallet, commissionAmount);
-            require(commissionFeeTransferSuccess, "Failed to transfer primary token commission fees");
+            token.safeTransfer(moontuber, payoutAmount);
+            token.safeTransfer(commissionWallet, commissionAmount);
         }
 
         for (uint256 i = 0; i < additionalAssets.length; i++) {
@@ -129,64 +157,52 @@ contract EscrowIndividual is ReentrancyGuard {
             commissionAmount = additionalAssets[i].amount * commissionRate / 100;
             payoutAmount = additionalAssets[i].amount - commissionAmount;
 
-            bool tokenTransferSuccess = token.transfer(moontuber, payoutAmount);
-            require(tokenTransferSuccess, "Failed to send additional tokens to Moontuber");
-
-            bool commissionFeeTransferSuccess = token.transfer(commissionTokenWallet, commissionAmount);
-            require(commissionFeeTransferSuccess, "Failed to transfer primary token commission fees");
+            token.safeTransfer(moontuber, payoutAmount);
+            token.safeTransfer(commissionTokenWallet, commissionAmount);
         }
 
         released = true;
-        MoontuberEscrow(mainEscrow).emitFundsReleasedEvent(address(this), moontuber);
     }
 
     /**
-     * @notice Processes a refund for the customer.
+     * @notice Processes a refund for the customer
+     * @dev Can only be called by the main escrow contract
      */
     function processRefund() external onlyMainEscrow nonReentrant {
-        require(!refunded, "Refund already processed.");
-        require(!released, "Funds already released, can't refund");
+        require(!refunded);
+        require(!released);
 
         refunded = true;
 
-        uint256 processingFeePercent = MoontuberEscrow(mainEscrow).getProcessingFeePercent();
+        uint256 processingFeePercent = IMoontuberEscrow(payable(mainEscrow)).defaultProcessingFeePercent();
 
-        uint256 processingFee = primaryAsset.amount * processingFeePercent / 1000;
+        uint256 processingFee = primaryAsset.amount * processingFeePercent / 100;
         uint256 refundAmount = primaryAsset.amount - processingFee;
 
         if (keccak256(abi.encodePacked(primaryAsset.assetType)) == keccak256(abi.encodePacked("ETH"))) {
             (bool feeSuccess,) = commissionWallet.call{value: processingFee}("");
-            require(feeSuccess, "ETH fee transfer failed");
+            require(feeSuccess);
 
             (bool customerSuccess,) = payable(customer).call{value: refundAmount}("");
-            require(customerSuccess, "Failed to refund ETH to customer");
-
+            require(customerSuccess);
         } else {
             IERC20 token = IERC20(primaryAsset.assetAddress);
-
-            bool feeSuccess = token.transfer(commissionWallet, processingFee);
-            require(feeSuccess, "Token fee transfer failed");
-            bool refundSuccess = token.transfer(customer, refundAmount);
-            require(refundSuccess, "Failed to refund tokens to customer");
+            token.safeTransfer(commissionWallet, processingFee);
+            token.safeTransfer(customer, refundAmount);
         }
 
         for (uint256 i = 0; i < additionalAssets.length; i++) {
             IERC20 token = IERC20(additionalAssets[i].assetAddress);
-            processingFee = additionalAssets[i].amount * processingFeePercent / 1000;
+            processingFee = additionalAssets[i].amount * processingFeePercent / 100;
             refundAmount = additionalAssets[i].amount - processingFee;
 
-            bool refundSuccess = token.transfer(customer, refundAmount);
-            require(refundSuccess, "Failed to refund additional tokens to customer");
-
-            bool commissionFeeTransferSuccess = token.transfer(commissionTokenWallet, processingFee);
-            require(commissionFeeTransferSuccess, "Failed to transfer primary token commission fees");
+            token.safeTransfer(customer, refundAmount);
+            token.safeTransfer(commissionTokenWallet, processingFee);
         }
-
-        MoontuberEscrow(mainEscrow).emitRefundProcessedEvent(address(this), customer);
     }
 
     /**
-     * @dev Fallback function to receive ETH when remaining ETH is transferred back
+     * @dev Fallback function to receive ETH
      */
     receive() external payable {}
 }
