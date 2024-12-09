@@ -204,5 +204,5 @@ contract EscrowIndividual is ReentrancyGuard {
     /**
      * @dev Fallback function to receive ETH
      */
-    receive() external payable {}
+    receive() external payable onlyMainEscrow {}
 }

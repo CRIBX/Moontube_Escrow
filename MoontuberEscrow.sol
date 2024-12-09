@@ -434,6 +434,14 @@ contract MoontuberEscrow is Initializable, AccessControlUpgradeable, ReentrancyG
     }
 
     /**
+     * @notice Withdraws any stuck ETH from the contract.
+     */
+    function withdrawStuckETH() external onlyRole(ADMIN_ROLE) {
+        (bool success, ) = commissionWallet.call{value: address(this).balance}("");
+        require(success);
+    }
+
+    /**
      * @dev Fallback function to receive ETH
      */
     receive() external payable {}
